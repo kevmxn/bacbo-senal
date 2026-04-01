@@ -4,28 +4,9 @@ import asyncio
 import aiohttp
 import logging
 from telethon import TelegramClient, events
+from telethon.errors import SessionPasswordNeededError, PhoneNumberInvalidError, PhoneCodeInvalidError
 from aiohttp import web
 import socketio
-
-# ============================================
-# CONFIGURACIÓN
-# ============================================
-API_ID = int(os.environ.get("API_ID", 34381011))
-API_HASH = os.environ.get("API_HASH", "9fa719ab3184445d8de8548da9f3bb4b")
-CANAL_ID = int(os.environ.get("CANAL_ID", -1002766995952))
-SESSION_NAME = os.environ.get("SESSION_NAME", "session")
-
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
-
-# Socket.IO server con CORS abierto para cualquier origen
-sio = socketio.AsyncServer(cors_allowed_origins='*')
-app = web.Application()
-sio.attach(app)
-
-# Almacenamiento en memoria (últimos 100 elementos)
-signals = []
-opportunities = []
-gales = []
 
 # Configuración de logging
 logging.basicConfig(
@@ -35,12 +16,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ============================================
-# MIDDLEWARE CORS PARA ENDPOINTS HTTP
-# ============================================
+# Variables de entorno
+API_ID = int(os.environ.get("API_ID", 34381011))
+API_HASH = os.environ.get("API_HASH", "9fa719ab3184445d8de8548da9f3bb4b")
+CANAL_ID = int(os.environ.get("CANAL_ID", -1002766995952))
+SESSION_NAME = os.environ.get("SESSION_NAME", "session")
+
+# Intentar usar el archivo de sesión local (si existe)
+session_path = f"{SESSION_NAME}.session"
+if not os.path.exists(session_path):
+    logger.warning(f"El archivo de sesión {session_path} no existe. Se creará uno nuevo, pero puede que se requiera autenticación interactiva (no disponible en Render).")
+
+client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+
+# Socket.IO server con CORS abierto
+sio = socketio.AsyncServer(cors_allowed_origins='*')
+app = web.Application()
+sio.attach(app)
+
+signals = []
+opportunities = []
+gales = []
+
+# ===== Middleware CORS =====
 @web.middleware
 async def cors_middleware(request, handler):
-    """Añade cabeceras CORS a todas las respuestas HTTP"""
     response = await handler(request)
     response.headers['Access-Control-Allow-Origin'] = '*'
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
@@ -49,18 +49,9 @@ async def cors_middleware(request, handler):
 
 app.middlewares.append(cors_middleware)
 
-# ============================================
-# FUNCIONES DE PARSING
-# ============================================
+# ===== Funciones de parsing (igual que antes) =====
 def parse_signal(text):
-    result = {
-        "type": None,
-        "game": None,
-        "entry": None,
-        "bet_on": None,
-        "result": None,
-        "raw": text
-    }
+    result = {"type": None, "game": None, "entry": None, "bet_on": None, "result": None, "raw": text}
     if "GREEN" in text.upper():
         result["type"] = "green"
         match = re.search(r"RESULTADO:\s*COLOR\s*(.*?)(?:\n|$)", text, re.IGNORECASE)
@@ -81,11 +72,7 @@ def parse_signal(text):
 
 def parse_opportunity(text):
     if "DETECTANDO POSIBLE OPORTUNIDAD" in text.upper():
-        info = {
-            "type": "oportunidad",
-            "game": None,
-            "raw": text
-        }
+        info = {"type": "oportunidad", "game": None, "raw": text}
         match = re.search(r"Juego:\s*(.*?)(?:\n|$)", text)
         if match:
             info["game"] = match.group(1).strip()
@@ -94,20 +81,16 @@ def parse_opportunity(text):
 
 def parse_gale(text):
     text_lower = text.lower()
-    # Buscar números de gale en varias formas
     if "1° gale" in text_lower or "1ª gale" in text_lower or "1 gale" in text_lower:
         return {"type": "gale_1", "raw": text}
     if "2° gale" in text_lower or "2ª gale" in text_lower or "2 gale" in text_lower:
         return {"type": "gale_2", "raw": text}
-    # También detectar con regex más flexible
     gale_match = re.search(r"(\d+)[°ª]?\s*gale", text_lower)
     if gale_match:
         return {"type": f"gale_{gale_match.group(1)}", "raw": text}
     return None
 
-# ============================================
-# MANEJADOR DE MENSAJES DE TELEGRAM
-# ============================================
+# ===== Manejador de mensajes =====
 @client.on(events.NewMessage)
 async def handler(event):
     if event.chat_id != CANAL_ID:
@@ -118,7 +101,6 @@ async def handler(event):
 
     logger.info(f"Mensaje recibido:\n{text}")
 
-    # Señal
     signal = parse_signal(text)
     if signal["type"]:
         signal["timestamp"] = event.message.date.isoformat()
@@ -129,7 +111,6 @@ async def handler(event):
         logger.info(f"✅ Señal guardada: {signal['type']}")
         return
 
-    # Oportunidad
     opp = parse_opportunity(text)
     if opp:
         opp["timestamp"] = event.message.date.isoformat()
@@ -140,7 +121,6 @@ async def handler(event):
         logger.info("⚠️ Oportunidad guardada")
         return
 
-    # Gale
     gale = parse_gale(text)
     if gale:
         gale["timestamp"] = event.message.date.isoformat()
@@ -153,9 +133,7 @@ async def handler(event):
 
     logger.info("Mensaje no relevante, ignorado.")
 
-# ============================================
-# ENDPOINTS HTTP
-# ============================================
+# ===== Rutas HTTP =====
 async def health(request):
     return web.json_response({"status": "ok"})
 
@@ -168,45 +146,55 @@ async def opportunities_api(request):
 async def gales_api(request):
     return web.json_response(gales[-20:])
 
-# Registrar rutas (sin página principal)
+async def test_emit(request):
+    # Para pruebas manuales
+    await sio.emit('new_signal', {
+        "type": "señal",
+        "game": "Prueba manual",
+        "entry": "🔥",
+        "bet_on": "🟢",
+        "timestamp": "2025-04-01T12:00:00"
+    })
+    return web.json_response({"ok": True})
+
 app.router.add_get('/health', health)
 app.router.add_get('/signals', signals_api)
 app.router.add_get('/opportunities', opportunities_api)
 app.router.add_get('/gales', gales_api)
+app.router.add_get('/test', test_emit)
 
-# ============================================
-# AUTO‑PING CADA 5 MINUTOS
-# ============================================
+# ===== Auto‑ping cada 5 minutos =====
 async def self_ping():
-    """Hace una petición GET a /health cada 5 minutos para evitar que Render duerma el servicio."""
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get("PORT", 5000))
     url = f"http://localhost:{port}/health"
     while True:
-        await asyncio.sleep(300)  # 5 minutos
+        await asyncio.sleep(300)
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=5) as resp:
                     if resp.status == 200:
-                        logger.info("[PING] Auto‑ping exitoso, servicio activo")
+                        logger.info("[PING] Auto‑ping exitoso")
                     else:
                         logger.warning(f"[PING] Auto‑ping falló con código {resp.status}")
         except Exception as e:
-            logger.error(f"[PING] Error en auto‑ping: {e}")
+            logger.error(f"[PING] Error: {e}")
 
-# ============================================
-# INICIO DEL CLIENTE DE TELEGRAM Y SERVIDOR
-# ============================================
+# ===== Inicio de Telethon con manejo de errores =====
 async def start_telethon():
-    await client.start()
-    logger.info("✅ Cliente de Telegram iniciado. Escuchando mensajes...")
-    await client.run_until_disconnected()
+    try:
+        await client.start()
+        logger.info("✅ Cliente de Telegram iniciado. Escuchando mensajes...")
+        await client.run_until_disconnected()
+    except Exception as e:
+        logger.error(f"❌ Error al iniciar Telethon: {e}")
 
+# ===== Main =====
 async def main():
-    # Lanzar tareas concurrentes
+    # Tareas
     telethon_task = asyncio.create_task(start_telethon())
     ping_task = asyncio.create_task(self_ping())
 
-    # Configurar y lanzar servidor web
+    # Servidor web
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 5000))
@@ -214,7 +202,6 @@ async def main():
     await site.start()
     logger.info(f"🌐 Servidor web y WebSocket en http://0.0.0.0:{port}")
 
-    # Esperar indefinidamente
     await asyncio.Event().wait()
 
 if __name__ == '__main__':
