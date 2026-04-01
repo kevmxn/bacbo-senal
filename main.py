@@ -1,9 +1,7 @@
 import os
-import re
 import asyncio
 import aiohttp
 import logging
-from datetime import datetime
 from telethon import TelegramClient, events
 from aiohttp import web
 import socketio
@@ -16,7 +14,6 @@ API_HASH = os.environ.get("API_HASH", "9fa719ab3184445d8de8548da9f3bb4b")
 CANAL_ID = int(os.environ.get("CANAL_ID", -1002766995952))
 SESSION_NAME = os.environ.get("SESSION_NAME", "session")
 
-# Logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -24,67 +21,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Variables globales
-signals = []
-opportunities = []
-gales = []
+# Variables globales (para guardar últimos mensajes si se desea)
+messages_history = []   # opcional, para tener los últimos 100 mensajes
 
 # ============================================
-# FUNCIONES DE PARSING
-# ============================================
-def parse_signal(text):
-    result = {
-        "type": None,
-        "game": None,
-        "entry": None,
-        "bet_on": None,
-        "result": None,
-        "raw": text
-    }
-    if "GREEN" in text.upper():
-        result["type"] = "green"
-        match = re.search(r"RESULTADO:\s*COLOR\s*(.*?)(?:\n|$)", text, re.IGNORECASE)
-        if match:
-            result["result"] = match.group(1).strip()
-    elif "ENTRADA CONFIRMADA" in text:
-        result["type"] = "señal"
-        match = re.search(r"Juego:\s*(.*?)(?:\n|$)", text)
-        if match:
-            result["game"] = match.group(1).strip()
-        match = re.search(r"INGRESAR DESPUÉS:\s*(.*?)(?:\n|$)", text)
-        if match:
-            result["entry"] = match.group(1).strip()
-        match = re.search(r"APUESTA EN:\s*(.*?)(?:\n|$)", text)
-        if match:
-            result["bet_on"] = match.group(1).strip()
-    return result
-
-def parse_opportunity(text):
-    if "DETECTANDO POSIBLE OPORTUNIDAD" in text.upper():
-        info = {
-            "type": "oportunidad",
-            "game": None,
-            "raw": text
-        }
-        match = re.search(r"Juego:\s*(.*?)(?:\n|$)", text)
-        if match:
-            info["game"] = match.group(1).strip()
-        return info
-    return None
-
-def parse_gale(text):
-    text_lower = text.lower()
-    if "1° gale" in text_lower or "1ª gale" in text_lower or "1 gale" in text_lower:
-        return {"type": "gale_1", "raw": text}
-    if "2° gale" in text_lower or "2ª gale" in text_lower or "2 gale" in text_lower:
-        return {"type": "gale_2", "raw": text}
-    gale_match = re.search(r"(\d+)[°ª]?\s*gale", text_lower)
-    if gale_match:
-        return {"type": f"gale_{gale_match.group(1)}", "raw": text}
-    return None
-
-# ============================================
-# MANEJADOR DE MENSAJES DE TELEGRAM
+# MANEJADOR DE MENSAJES (TODOS)
 # ============================================
 def create_handler(client, sio):
     @client.on(events.NewMessage)
@@ -97,37 +38,24 @@ def create_handler(client, sio):
 
         logger.info(f"Mensaje recibido:\n{text}")
 
-        signal = parse_signal(text)
-        if signal["type"]:
-            signal["timestamp"] = event.message.date.isoformat()
-            signals.append(signal)
-            if len(signals) > 100:
-                signals.pop(0)
-            await sio.emit('new_signal', signal)
-            logger.info(f"✅ Señal guardada: {signal['type']}")
-            return
+        # Crear objeto con todos los datos relevantes
+        message_data = {
+            'text': text,
+            'timestamp': event.message.date.isoformat(),
+            'message_id': event.message.id,
+            'sender_id': event.sender_id,
+            'chat_id': event.chat_id
+        }
 
-        opp = parse_opportunity(text)
-        if opp:
-            opp["timestamp"] = event.message.date.isoformat()
-            opportunities.append(opp)
-            if len(opportunities) > 100:
-                opportunities.pop(0)
-            await sio.emit('new_opportunity', opp)
-            logger.info("⚠️ Oportunidad guardada")
-            return
+        # Guardar en memoria (opcional, últimos 100)
+        messages_history.append(message_data)
+        if len(messages_history) > 100:
+            messages_history.pop(0)
 
-        gale = parse_gale(text)
-        if gale:
-            gale["timestamp"] = event.message.date.isoformat()
-            gales.append(gale)
-            if len(gales) > 100:
-                gales.pop(0)
-            await sio.emit('new_gale', gale)
-            logger.info(f"🔄 Gale guardado: {gale['type']}")
-            return
+        # Emitir a todos los clientes conectados
+        await sio.emit('new_message', message_data)
+        logger.info("📨 Mensaje emitido a todos los clientes")
 
-        logger.info("Mensaje no relevante, ignorado.")
     return handler
 
 # ============================================
@@ -146,19 +74,13 @@ async def run_telethon(client):
             await asyncio.sleep(5)
 
 # ============================================
-# ENDPOINTS HTTP
+# ENDPOINTS HTTP (opcionales)
 # ============================================
 async def health(request):
     return web.json_response({"status": "ok"})
 
-async def signals_api(request):
-    return web.json_response(signals[-20:])
-
-async def opportunities_api(request):
-    return web.json_response(opportunities[-20:])
-
-async def gales_api(request):
-    return web.json_response(gales[-20:])
+async def last_messages(request):
+    return web.json_response(messages_history[-20:])
 
 # ============================================
 # AUTO‑PING CADA 5 MINUTOS
@@ -192,19 +114,15 @@ async def cors_middleware(request, handler):
 # MAIN
 # ============================================
 async def main():
-    global signals, opportunities, gales
-
     # Servidor web + Socket.IO
     sio = socketio.AsyncServer(cors_allowed_origins='*')
     app = web.Application(middlewares=[cors_middleware])
     sio.attach(app)
 
     app.router.add_get('/health', health)
-    app.router.add_get('/signals', signals_api)
-    app.router.add_get('/opportunities', opportunities_api)
-    app.router.add_get('/gales', gales_api)
+    app.router.add_get('/messages', last_messages)   # endpoint para ver últimos mensajes
 
-    # Iniciar el servidor
+    # Iniciar servidor web
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get('PORT', 5000))
@@ -212,7 +130,7 @@ async def main():
     await site.start()
     logger.info(f"🌐 Servidor web y WebSocket en http://0.0.0.0:{port}")
 
-    # Crear cliente de Telegram (con la sesión)
+    # Crear cliente de Telegram con la sesión
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
     # Agregar manejador de mensajes
