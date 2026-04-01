@@ -2,13 +2,12 @@ FROM python:3.9-slim
 
 WORKDIR /app
 
+# Copiar requirements.txt e instalar dependencias
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copiar el resto del código (incluyendo main.py y session.session)
 COPY . .
-
-# Si tienes la sesión, copia el archivo (asegúrate de que exista)
-COPY session.session .
 
 EXPOSE 5000
 
