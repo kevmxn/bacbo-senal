@@ -1,11 +1,15 @@
 import os
 import re
 import asyncio
+import aiohttp
+import logging
 from telethon import TelegramClient, events
 from aiohttp import web
 import socketio
 
-# Configuración desde variables de entorno
+# ============================================
+# CONFIGURACIÓN
+# ============================================
 API_ID = int(os.environ.get("API_ID", 34381011))
 API_HASH = os.environ.get("API_HASH", "9fa719ab3184445d8de8548da9f3bb4b")
 CANAL_ID = int(os.environ.get("CANAL_ID", -1002766995952))
@@ -13,15 +17,41 @@ SESSION_NAME = os.environ.get("SESSION_NAME", "session")
 
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
-# Socket.IO server
+# Socket.IO server con CORS abierto para cualquier origen
 sio = socketio.AsyncServer(cors_allowed_origins='*')
 app = web.Application()
 sio.attach(app)
 
+# Almacenamiento en memoria (últimos 100 elementos)
 signals = []
 opportunities = []
 gales = []
 
+# Configuración de logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# ============================================
+# MIDDLEWARE CORS PARA ENDPOINTS HTTP
+# ============================================
+@web.middleware
+async def cors_middleware(request, handler):
+    """Añade cabeceras CORS a todas las respuestas HTTP"""
+    response = await handler(request)
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    return response
+
+app.middlewares.append(cors_middleware)
+
+# ============================================
+# FUNCIONES DE PARSING
+# ============================================
 def parse_signal(text):
     result = {
         "type": None,
@@ -64,16 +94,20 @@ def parse_opportunity(text):
 
 def parse_gale(text):
     text_lower = text.lower()
-    gale_match = re.search(r"(\d+)[°ª]?\s*gale", text_lower)
-    if gale_match:
-        gale_number = gale_match.group(1)
-        return {"type": f"gale_{gale_number}", "raw": text}
+    # Buscar números de gale en varias formas
     if "1° gale" in text_lower or "1ª gale" in text_lower or "1 gale" in text_lower:
         return {"type": "gale_1", "raw": text}
     if "2° gale" in text_lower or "2ª gale" in text_lower or "2 gale" in text_lower:
         return {"type": "gale_2", "raw": text}
+    # También detectar con regex más flexible
+    gale_match = re.search(r"(\d+)[°ª]?\s*gale", text_lower)
+    if gale_match:
+        return {"type": f"gale_{gale_match.group(1)}", "raw": text}
     return None
 
+# ============================================
+# MANEJADOR DE MENSAJES DE TELEGRAM
+# ============================================
 @client.on(events.NewMessage)
 async def handler(event):
     if event.chat_id != CANAL_ID:
@@ -82,8 +116,9 @@ async def handler(event):
     if not text:
         return
 
-    print("Mensaje recibido:\n", text)
+    logger.info(f"Mensaje recibido:\n{text}")
 
+    # Señal
     signal = parse_signal(text)
     if signal["type"]:
         signal["timestamp"] = event.message.date.isoformat()
@@ -91,8 +126,10 @@ async def handler(event):
         if len(signals) > 100:
             signals.pop(0)
         await sio.emit('new_signal', signal)
+        logger.info(f"✅ Señal guardada: {signal['type']}")
         return
 
+    # Oportunidad
     opp = parse_opportunity(text)
     if opp:
         opp["timestamp"] = event.message.date.isoformat()
@@ -100,8 +137,10 @@ async def handler(event):
         if len(opportunities) > 100:
             opportunities.pop(0)
         await sio.emit('new_opportunity', opp)
+        logger.info("⚠️ Oportunidad guardada")
         return
 
+    # Gale
     gale = parse_gale(text)
     if gale:
         gale["timestamp"] = event.message.date.isoformat()
@@ -109,29 +148,73 @@ async def handler(event):
         if len(gales) > 100:
             gales.pop(0)
         await sio.emit('new_gale', gale)
+        logger.info(f"🔄 Gale guardado: {gale['type']}")
         return
 
-async def index(request):
-    return web.FileResponse('./static/index.html')
+    logger.info("Mensaje no relevante, ignorado.")
 
-app.router.add_get('/', index)
-app.router.add_get('/signals', lambda r: web.json_response(signals[-20:]))
-app.router.add_get('/opportunities', lambda r: web.json_response(opportunities[-20:]))
-app.router.add_get('/gales', lambda r: web.json_response(gales[-20:]))
+# ============================================
+# ENDPOINTS HTTP
+# ============================================
+async def health(request):
+    return web.json_response({"status": "ok"})
 
+async def signals_api(request):
+    return web.json_response(signals[-20:])
+
+async def opportunities_api(request):
+    return web.json_response(opportunities[-20:])
+
+async def gales_api(request):
+    return web.json_response(gales[-20:])
+
+# Registrar rutas (sin página principal)
+app.router.add_get('/health', health)
+app.router.add_get('/signals', signals_api)
+app.router.add_get('/opportunities', opportunities_api)
+app.router.add_get('/gales', gales_api)
+
+# ============================================
+# AUTO‑PING CADA 5 MINUTOS
+# ============================================
+async def self_ping():
+    """Hace una petición GET a /health cada 5 minutos para evitar que Render duerma el servicio."""
+    port = int(os.environ.get('PORT', 5000))
+    url = f"http://localhost:{port}/health"
+    while True:
+        await asyncio.sleep(300)  # 5 minutos
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=5) as resp:
+                    if resp.status == 200:
+                        logger.info("[PING] Auto‑ping exitoso, servicio activo")
+                    else:
+                        logger.warning(f"[PING] Auto‑ping falló con código {resp.status}")
+        except Exception as e:
+            logger.error(f"[PING] Error en auto‑ping: {e}")
+
+# ============================================
+# INICIO DEL CLIENTE DE TELEGRAM Y SERVIDOR
+# ============================================
 async def start_telethon():
     await client.start()
-    print("✅ Cliente de Telegram iniciado. Escuchando mensajes...")
+    logger.info("✅ Cliente de Telegram iniciado. Escuchando mensajes...")
     await client.run_until_disconnected()
 
 async def main():
+    # Lanzar tareas concurrentes
     telethon_task = asyncio.create_task(start_telethon())
+    ping_task = asyncio.create_task(self_ping())
+
+    # Configurar y lanzar servidor web
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 5000))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    print(f"🌐 Servidor en http://0.0.0.0:{port}")
+    logger.info(f"🌐 Servidor web y WebSocket en http://0.0.0.0:{port}")
+
+    # Esperar indefinidamente
     await asyncio.Event().wait()
 
 if __name__ == '__main__':
