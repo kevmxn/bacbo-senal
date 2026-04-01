@@ -8,7 +8,7 @@ client = TelegramClient(session_name, api_id, api_hash)
 
 async def main():
     await client.start()
-    print("✅ Sesión creada. Ahora puedes detener este script (Ctrl+C).")
+    print("Sesión creada. Ahora puedes detener este script (Ctrl+C).")
     await client.run_until_disconnected()
 
 with client:
